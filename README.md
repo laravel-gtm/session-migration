@@ -1,58 +1,155 @@
-<p align="center"><a href="https://laravel.com" target="_blank"><img src="https://raw.githubusercontent.com/laravel/art/master/logo-lockup/5%20SVG/2%20CMYK/1%20Full%20Color/laravel-logolockup-cmyk-red.svg" width="400" alt="Laravel Logo"></a></p>
+# Session Migration Demo
 
-<p align="center">
-<a href="https://github.com/laravel/framework/actions"><img src="https://github.com/laravel/framework/workflows/tests/badge.svg" alt="Build Status"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/dt/laravel/framework" alt="Total Downloads"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/v/laravel/framework" alt="Latest Stable Version"></a>
-<a href="https://packagist.org/packages/laravel/framework"><img src="https://img.shields.io/packagist/l/laravel/framework" alt="License"></a>
-</p>
+A Laravel demo app that demonstrates how to migrate encrypted Redis sessions between servers (or Redis vendors) without logging users out.
 
-## About Laravel
+## Overview
 
-Laravel is a web application framework with expressive, elegant syntax. We believe development must be an enjoyable and creative experience to be truly fulfilling. Laravel takes the pain out of development by easing common tasks used in many web projects, such as:
+This app uses Laravel Fortify for authentication with encrypted sessions stored in Redis. It provides a dashboard that displays session data in plain text, proving that encrypted session data can be read from Redis and decrypted by Laravel using the `APP_KEY`.
 
-- [Simple, fast routing engine](https://laravel.com/docs/routing).
-- [Powerful dependency injection container](https://laravel.com/docs/container).
-- Multiple back-ends for [session](https://laravel.com/docs/session) and [cache](https://laravel.com/docs/cache) storage.
-- Expressive, intuitive [database ORM](https://laravel.com/docs/eloquent).
-- Database agnostic [schema migrations](https://laravel.com/docs/migrations).
-- [Robust background job processing](https://laravel.com/docs/queues).
-- [Real-time event broadcasting](https://laravel.com/docs/broadcasting).
+### Key Configuration
 
-Laravel is accessible, powerful, and provides tools required for large, robust applications.
+| Setting | Value |
+|---------|-------|
+| Session Driver | `redis` |
+| Session Encryption | `true` |
+| Session Serialization | `json` |
+| Redis Client | `phpredis` |
 
-## Learning Laravel
-
-Laravel has the most extensive and thorough [documentation](https://laravel.com/docs) and video tutorial library of all modern web application frameworks, making it a breeze to get started with the framework.
-
-In addition, [Laracasts](https://laracasts.com) contains thousands of video tutorials on a range of topics including Laravel, modern PHP, unit testing, and JavaScript. Boost your skills by digging into our comprehensive video library.
-
-You can also watch bite-sized lessons with real-world projects on [Laravel Learn](https://laravel.com/learn), where you will be guided through building a Laravel application from scratch while learning PHP fundamentals.
-
-## Agentic Development
-
-Laravel's predictable structure and conventions make it ideal for AI coding agents like Claude Code, Cursor, and GitHub Copilot. Install [Laravel Boost](https://laravel.com/docs/ai) to supercharge your AI workflow:
+## Local Setup
 
 ```bash
-composer require laravel/boost --dev
-
-php artisan boost:install
+composer install
+bun install && bun run build
+cp .env.example .env   # then configure DB and Redis
+php artisan key:generate
+php artisan migrate
 ```
 
-Boost provides your agent 15+ tools and skills that help agents build Laravel applications while following best practices.
+If using Laravel Herd, the app is available at `https://session-migration.test`.
 
-## Contributing
+## Usage
 
-Thank you for considering contributing to the Laravel framework! The contribution guide can be found in the [Laravel documentation](https://laravel.com/docs/contributions).
+1. Visit `/register` to create a user
+2. After login, the dashboard shows all session data as decrypted plain text
+3. Add custom key/value pairs to the session via the form
+4. Visit `/session/raw` to see the encrypted Redis blob alongside the decrypted output
 
-## Code of Conduct
+## Session Migration Guide
 
-In order to ensure that the Laravel community is welcoming to all, please review and abide by the [Code of Conduct](https://laravel.com/docs/contributions#code-of-conduct).
+### Prerequisites
 
-## Security Vulnerabilities
+- The **source** server is running this app with sessions in Redis
+- The **destination** server has the app deployed and ready to receive traffic
+- Both servers must share the same `APP_KEY` (found in `.env`)
 
-If you discover a security vulnerability within Laravel, please send an e-mail to Taylor Otwell via [taylor@laravel.com](mailto:taylor@laravel.com). All security vulnerabilities will be promptly addressed.
+### Step 1: Copy the APP_KEY
 
-## License
+The `APP_KEY` is used to encrypt and decrypt session data. The destination server **must** have the exact same key.
 
-The Laravel framework is open-sourced software licensed under the [MIT license](https://opensource.org/licenses/MIT).
+```bash
+# On the source server
+grep APP_KEY .env
+# APP_KEY=base64:xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx=
+
+# Copy this value to the destination server's .env
+```
+
+> If the keys don't match, Laravel on the new server won't be able to decrypt existing sessions and all users will be logged out.
+
+### Step 2: Export Redis Data
+
+Choose one of these methods depending on your setup:
+
+#### Option A: RDB Snapshot (full Redis migration)
+
+```bash
+# On the source Redis server
+redis-cli BGSAVE
+# Wait for the snapshot to complete
+redis-cli LASTSAVE
+
+# Copy the dump file to the destination
+scp /var/lib/redis/dump.rdb destination-server:/var/lib/redis/dump.rdb
+
+# Restart Redis on the destination to load the snapshot
+ssh destination-server 'sudo systemctl restart redis'
+```
+
+#### Option B: DUMP/RESTORE (selective key migration)
+
+Useful when you only want to migrate session keys, not the entire Redis database.
+
+```bash
+# Export all session keys from source
+redis-cli --scan --pattern 'session-migration-database-*' | while read key; do
+    ttl=$(redis-cli TTL "$key")
+    dump=$(redis-cli DUMP "$key")
+    # RESTORE on destination (adjust host/port)
+    redis-cli -h destination-host RESTORE "$key" "$ttl" "$dump" REPLACE
+done
+```
+
+#### Option C: Redis replication (zero-downtime)
+
+Set up the destination Redis as a replica of the source, then promote it to primary after the DNS switch.
+
+```bash
+# On the destination Redis
+redis-cli REPLICAOF source-host 6379
+
+# After DNS cutover, promote to primary
+redis-cli REPLICAOF NO ONE
+```
+
+### Step 3: Verify Session Config
+
+Ensure the destination server's `.env` and config match the source:
+
+```env
+SESSION_DRIVER=redis
+SESSION_ENCRYPT=true
+SESSION_LIFETIME=120
+
+REDIS_CLIENT=phpredis
+REDIS_HOST=127.0.0.1       # or new Redis host
+REDIS_PORT=6379
+```
+
+Also verify that `config/session.php` has `'serialization' => 'json'` (or matches the source).
+
+### Step 4: Switch Traffic
+
+Update DNS or your load balancer to point to the destination server. Users' session cookies contain a session ID that maps to a Redis key — as long as:
+
+1. The Redis key exists on the new server
+2. The `APP_KEY` matches
+3. The session config matches
+
+...users remain logged in seamlessly.
+
+### Step 5: Verify
+
+1. Log in on the source server and add some custom session data
+2. Switch to the destination server
+3. Visit `/dashboard` — your session data should appear
+4. Visit `/session/raw` — the encrypted Redis blob should decrypt correctly
+
+## Changing Redis Vendors
+
+The same process applies when migrating between Redis vendors (e.g., from self-hosted Redis to AWS ElastiCache, Upstash, or Redis Cloud):
+
+1. Export data from the current Redis instance
+2. Import into the new vendor's Redis instance
+3. Update `REDIS_HOST`, `REDIS_PORT`, and `REDIS_PASSWORD` in `.env`
+4. Verify the Redis key prefix matches (`session-migration-database-` by default, set via `REDIS_PREFIX`)
+5. Deploy — sessions persist because the data and `APP_KEY` are unchanged
+
+## Troubleshooting
+
+| Problem | Cause | Fix |
+|---------|-------|-----|
+| All users logged out after migration | `APP_KEY` mismatch | Copy the exact `APP_KEY` from the source `.env` |
+| Session data exists but can't decrypt | `SESSION_ENCRYPT` was off on source, on at destination (or vice versa) | Ensure both servers have the same `SESSION_ENCRYPT` value |
+| Redis keys not found | Key prefix mismatch | Check `REDIS_PREFIX` in `.env` and `config/database.php` — default is `{app-name}-database-` |
+| Session cookie not sent to new server | Domain mismatch | Ensure `SESSION_DOMAIN` matches or is `null` for same-domain |
+| Serialization error | Serialization format mismatch | Both servers must use the same `session.serialization` value (`json` or `php`) |
